@@ -30,8 +30,10 @@ async def group_redirect(message: types.Message):
 
 user_selected_category = {}
 user_state = {}
+pending_question = {}
 STATE_NONE = "NONE"
 STATE_AWAITING_QUESTION = "AWAITING_QUESTION"
+STATE_CONFIRM_PENDING = "CONFIRM_PENDING"
 
 STATE_REG_NAME = "REG_NAME"
 STATE_REG_LASTNAME = "REG_LASTNAME"
@@ -127,7 +129,96 @@ async def handle_message(message: types.Message):
     current_cat = user_selected_category.get(user_id, None)
     current_state = user_state.get(user_id, STATE_NONE)
 
-    if text == "📋 Register":
+    if current_state == STATE_CONFIRM_PENDING:
+        # Пользователь отвечает "yes" или "no" на предложение отправить pending вопрос
+        if text.lower() == "yes":
+            # 1) Достаём pending вопрос
+            pending = pending_question.pop(user_id, None)
+            if not pending:
+                await message.answer("No pending question found.")
+                user_state[user_id] = STATE_NONE
+                return
+
+            # 2) Отправляем вопрос (дублируем логику, как в AWAITING_QUESTION)
+            #    или выносим в отдельную функцию.
+
+            teleuser = await get_teleuser_by_id(user_id)
+            if not teleuser:
+                # Теоретически не должно быть такого, ведь мы только что зарегистрировались
+                await message.answer("You are not registered yet.")
+                user_state[user_id] = STATE_NONE
+                return
+
+            first_n = teleuser.first_name or ""
+            last_n = teleuser.last_name or ""
+            nick_n = teleuser.nickname or ""
+            user_display = f"{first_n} {last_n} ({nick_n}) - @{message.from_user.username or user_id}".strip()
+
+            category_name = pending["category"]
+            question_text = pending["question"]
+
+            # Сохраняем вопрос
+            category_obj = await sync_to_async(lambda: Category.objects.get(name=category_name))()
+            responsible_chat = category_obj.responsible_chat
+            responsible_topic_id = category_obj.responsible_topic_id
+
+            await save_user_question_async(
+                user_id,
+                message.from_user.username or "",
+                category_name,
+                question_text,
+                responsible_id=responsible_chat
+            )
+
+            forward_text = (
+                f"New question from category <b>{category_name}</b>\n"
+                f"From user: {user_display}\n\n"
+                f"Question text:\n{question_text}"
+            )
+
+            if responsible_chat:
+                try:
+                    chat_id_for_sending = int(responsible_chat)
+                    if responsible_topic_id and responsible_topic_id.isdigit():
+                        topic_id_for_sending = int(responsible_topic_id)
+                        await bot.send_message(
+                            chat_id=chat_id_for_sending,
+                            text=forward_text,
+                            message_thread_id=topic_id_for_sending
+                        )
+                    else:
+                        await bot.send_message(chat_id_for_sending, forward_text)
+                except Exception as e:
+                    await message.answer(f"Failed to send to specialists: {e}")
+
+            await message.answer("Your pending question has been saved and forwarded to specialists. Thank you!")
+
+            # Возвращаемся к STATE_NONE и предлагаем категории
+            user_state[user_id] = STATE_NONE
+            categories = await get_categories_async()
+            kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+            for cat in categories:
+                kb.add(cat.name)
+            await message.answer("Choose category:", reply_markup=kb)
+            return
+
+        else:
+            # Пользователь ответил что-то иное, трактуем как "No"
+            pending_question.pop(user_id, None)
+            await message.answer("Pending question canceled.")
+            user_state[user_id] = STATE_NONE
+            # Показываем меню
+            categories = await get_categories_async()
+            kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+            existing_user = await get_teleuser_by_id(user_id)
+            if not existing_user:
+                kb.add("📋 Register")
+            for cat in categories:
+                kb.add(cat.name)
+            await message.answer("Choose category:", reply_markup=kb)
+            return
+
+    if text == "📋 Register" or text.lower() == "register":
         existing_user = await get_teleuser_by_id(user_id)
         if existing_user:
             await message.answer("You are already registered!")
@@ -135,7 +226,6 @@ async def handle_message(message: types.Message):
         else:
             user_state[user_id] = STATE_REG_NAME
             temp_user_data[user_id] = {}
-
             await message.answer("Enter your first name:", reply_markup=ReplyKeyboardRemove())
             return
 
@@ -172,6 +262,17 @@ async def handle_message(message: types.Message):
 
         user_state[user_id] = STATE_NONE
         temp_user_data[user_id] = {}
+
+        # Check if there's a pending question for this user
+        if user_id in pending_question:
+            pending = pending_question[user_id]
+            await message.answer(
+                f"You had a pending question in category '{pending['category']}':\n\n{pending['question']}\n\nDo you want to send it now? (Yes/No)"
+            )
+            user_selected_category[user_id] = None
+            user_state[user_id] = STATE_CONFIRM_PENDING
+            return
+
         categories = await get_categories_async()
         kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
         for cat in categories:
@@ -185,6 +286,7 @@ async def handle_message(message: types.Message):
 
         teleuser = await get_teleuser_by_id(user_id)
         if not teleuser:
+            pending_question[user_id] = {"category": current_cat, "question": text}
             kb = ReplyKeyboardMarkup(resize_keyboard=True)
             kb.add("📋 Register")
             categories = await get_categories_async()
@@ -205,6 +307,7 @@ async def handle_message(message: types.Message):
         nick_n = teleuser.nickname or ""
 
         user_display = f"{first_n} {last_n} ({nick_n}) - @{message.from_user.username or user_id}".strip()
+
 
 
         category_obj = await sync_to_async(lambda: Category.objects.get(name=current_cat))()
