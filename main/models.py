@@ -1,15 +1,35 @@
 from django.db import models
 
 # Create your models here.
+class Company(models.Model):
+    name = models.CharField(max_length=200, unique=True, blank=True)
+
+    def __str__(self):
+        return self.name
+
+
 class TeleUser(models.Model):
     telegram_id = models.BigIntegerField(unique=True, help_text="ID пользователя из Telegram")
     first_name = models.CharField(max_length=100, blank=True, null=True)
-    last_name = models.CharField(max_length=100, blank=True, null=True)
     nickname = models.CharField(max_length=100, blank=True, null=True)
     truck_number = models.CharField(max_length=100, blank=True, null=True)
+    company = models.ForeignKey(Company, null=True, blank=True, on_delete=models.SET_NULL)
 
     def __str__(self):
-        return f"{self.first_name} {self.last_name} ({self.nickname})"
+        return f"{self.first_name} ({self.nickname})"
+
+
+class TimeOff(models.Model):
+    teleuser = models.ForeignKey(TeleUser, on_delete=models.CASCADE)
+    date_from = models.DateField()
+    date_till = models.DateField()
+    reason = models.TextField()
+    pause_insurance = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"TimeOff {self.id} for {self.teleuser}"
+
 
 class Category(models.Model):
     name = models.CharField(max_length=200, unique=True)

@@ -1,12 +1,22 @@
 from django.contrib import admin
-from .models import Category, Question, UserQuestion,TeleUser
+from .models import *
 
 admin.site.site_header = "Sayram Express LLC"
 admin.site.site_title = "Sayram Express LLC Admin Page"
 
+@admin.register(Company)
+class CompanyAdmin(admin.ModelAdmin):
+    list_display = ('name',)
+
 @admin.register(TeleUser)
 class TeleUserAdmin(admin.ModelAdmin):
-    list_display = ('first_name', 'last_name', 'nickname', 'truck_number', 'telegram_id')
+    list_display = ('first_name', 'nickname', 'truck_number', 'company',  'telegram_id')
+
+
+@admin.register(TimeOff)
+class TimeOffAdmin(admin.ModelAdmin):
+    list_display = ('teleuser', 'date_from', 'date_till', 'reason',  'pause_insurance', 'created_at')
+
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):

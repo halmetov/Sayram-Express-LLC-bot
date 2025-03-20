@@ -17,7 +17,10 @@ from aiogram.types import (
     InputTextMessageContent
 )
 
-from main.models import Category, Question, UserQuestion, TeleUser
+from main.models import Category, Question, UserQuestion, TeleUser, Company, TimeOff
+from datetime import datetime
+import calendar
+from datetime import date
 
 logging.basicConfig(level=logging.INFO)
 
@@ -32,13 +35,20 @@ STATE_NONE = "NONE"
 STATE_AWAITING_QUESTION = "AWAITING_QUESTION"
 STATE_CONFIRM_PENDING = "CONFIRM_PENDING"
 
+# Registration states
 STATE_REG_NAME = "REG_NAME"
-STATE_REG_LASTNAME = "REG_LASTNAME"
 STATE_REG_NICKNAME = "REG_NICKNAME"
 STATE_REG_TRUCK = "REG_TRUCK"
+STATE_REG_COMPANY = "REG_COMPANY"  # New step: user chooses company
 
-# Новое состояние для inline-редактирования
+# Inline-edit state
 STATE_INLINE_EDIT = "INLINE_EDIT"
+
+# TimeOff states
+STATE_TIMEOFF_FROM = "TIMEOFF_FROM"
+STATE_TIMEOFF_TILL = "TIMEOFF_TILL"
+STATE_TIMEOFF_REASON = "TIMEOFF_REASON"
+STATE_TIMEOFF_PAUSE = "TIMEOFF_PAUSE"
 
 # ---------------------------
 #  Global dictionaries
@@ -56,13 +66,32 @@ def get_teleuser_by_id(telegram_id):
     return TeleUser.objects.filter(telegram_id=telegram_id).first()
 
 @sync_to_async
-def create_teleuser(telegram_id, first_name, last_name, nickname, truck_number):
+def create_teleuser(telegram_id, name, nickname, truck_number, company_id=None):
+    company_obj = None
+    if company_id:
+        company_obj = Company.objects.get(id=company_id)
+    # В модели TeleUser предположим, что у вас есть поле first_name (или name), nickname, truck_number, company
     return TeleUser.objects.create(
         telegram_id=telegram_id,
-        first_name=first_name,
-        last_name=last_name,
+        first_name=name,         # Используем поле first_name как "Name"
         nickname=nickname,
-        truck_number=truck_number
+        truck_number=truck_number,
+        company=company_obj
+    )
+
+@sync_to_async
+def get_companies():
+    return list(Company.objects.all())
+
+@sync_to_async
+def create_timeoff(teleuser_id, date_from, date_till, reason, pause):
+    user = TeleUser.objects.get(id=teleuser_id)
+    return TimeOff.objects.create(
+        teleuser=user,
+        date_from=date_from,
+        date_till=date_till,
+        reason=reason,
+        pause_insurance=pause
     )
 
 @sync_to_async
@@ -91,28 +120,25 @@ def save_user_question_async(user_id, username, category_name, question_text, re
         responsible_id=responsible_id
     )
 
+
 # ---------------------------
 #  Group messages handler
 # ---------------------------
 @dp.message_handler(lambda message: message.chat.type in ["group", "supergroup"])
 async def group_redirect(message: types.Message):
     text = message.text or ""
-    # Только если упомянули бота
     if "@sayram_help_bot" in text:
-        inline_kb = types.InlineKeyboardMarkup()
+        inline_kb = InlineKeyboardMarkup()
         bot_link = "https://t.me/sayram_help_bot"
         inline_kb.add(types.InlineKeyboardButton("Go to the bot's private messages", url=bot_link))
         await message.reply("To ask a question, please go to the bot's private messages:", reply_markup=inline_kb)
+
 
 # ---------------------------
 #  Inline Mode handler
 # ---------------------------
 @dp.inline_handler()
 async def inline_query_echo(inline_query: types.InlineQuery):
-    """
-    Если пользователь нажал кнопку с switch_inline_query_current_chat,
-    он попадает сюда. Возвращаем одну статью, которую можно «отправить» с изменённым текстом.
-    """
     text = inline_query.query or "Empty question"
     result = InlineQueryResultArticle(
         id="1",
@@ -121,6 +147,7 @@ async def inline_query_echo(inline_query: types.InlineQuery):
         input_message_content=InputTextMessageContent(text)
     )
     await inline_query.answer([result], cache_time=1, is_personal=True)
+
 
 # ---------------------------
 #  /start, /help
@@ -131,14 +158,134 @@ async def cmd_start(message: types.Message):
     user_selected_category[user_id] = None
     user_state[user_id] = STATE_NONE
 
-    categories = await get_categories_async()
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     existing_user = await get_teleuser_by_id(user_id)
     if not existing_user:
         kb.add("📋 Register")
+    # Кнопка Time Off
+    kb.add("Time Off")
+
+    categories = await get_categories_async()
     for cat in categories:
         kb.add(cat.name)
-    await message.answer("Hello! Select category or press 'Register': \n <b>Registration</b> takes 30 seconds and is required only once per ID.", reply_markup=kb)
+
+    await message.answer(
+        "Hello! Select category, press 'Time Off' or 'Register':",
+        reply_markup=kb
+    )
+
+def generate_calendar(year, month, min_date=None):
+    kb = InlineKeyboardMarkup(row_width=7)
+
+    # 1) Строка с навигацией (название месяца + кнопки < >)
+    row = []
+    row.append(InlineKeyboardButton("<", callback_data=f"CALENDAR:{year}:{month}:PREV"))
+    row.append(InlineKeyboardButton(f"{calendar.month_name[month]} {year}", callback_data="IGNORE"))
+    row.append(InlineKeyboardButton(">", callback_data=f"CALENDAR:{year}:{month}:NEXT"))
+    kb.row(*row)
+
+    # 2) Заголовок дней недели
+    week_days = ["Mo","Tu","We","Th","Fr","Sa","Su"]
+    row = [InlineKeyboardButton(day, callback_data="IGNORE") for day in week_days]
+    kb.row(*row)
+
+    # 3) Перебираем дни месяца
+    cal = calendar.Calendar(firstweekday=0)
+    month_days = cal.itermonthdates(year, month)
+
+    temp_row = []
+    for d in month_days:
+        if d.month != month:
+            # Дни не из этого месяца - пустые
+            btn = InlineKeyboardButton(" ", callback_data="IGNORE")
+        else:
+            # Проверяем min_date (если есть)
+            if min_date and d < min_date:
+                # Дата до min_date => неактивна
+                btn = InlineKeyboardButton(str(d.day), callback_data="IGNORE")
+            else:
+                # Можно выбрать
+                btn = InlineKeyboardButton(str(d.day),
+                                           callback_data=f"CALENDAR:{d.year}:{d.month}:{d.day}:DAY")
+        temp_row.append(btn)
+        if len(temp_row) == 7:
+            kb.row(*temp_row)
+            temp_row = []
+    if temp_row:
+        kb.row(*temp_row)
+
+    return kb
+
+
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("CALENDAR"))
+async def process_calendar_callback(callback_query: types.CallbackQuery):
+    data = callback_query.data.split(":")
+    # data = ["CALENDAR", "2023", "5", "NEXT"] ИЛИ ["CALENDAR", "2023", "5", "15", "DAY"]
+    year = int(data[1])
+    month = int(data[2])
+    action = data[-1]  # "PREV", "NEXT" или "DAY"
+
+    user_id = callback_query.from_user.id
+    # ВАЖНО: инициализируем temp_user_data, если не было
+    if user_id not in temp_user_data:
+        temp_user_data[user_id] = {}
+
+    if action == "PREV":
+        month -= 1
+        if month < 1:
+            month = 12
+            year -= 1
+        kb = generate_calendar(year, month)
+        await callback_query.message.edit_text("Select date:", reply_markup=kb)
+        await callback_query.answer()
+
+    elif action == "NEXT":
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+        kb = generate_calendar(year, month)
+        await callback_query.message.edit_text("Select date:", reply_markup=kb)
+        await callback_query.answer()
+
+    elif action == "DAY":
+        day = int(data[3])
+        selected_date = date(year, month, day)
+
+        user_id = callback_query.from_user.id
+        st = user_state.get(user_id)
+
+        if st == STATE_TIMEOFF_FROM:
+            # user wants FROM date
+            temp_user_data[user_id]["timeoff_from"] = selected_date
+            # теперь переключаемся на TILL
+            user_state[user_id] = STATE_TIMEOFF_TILL
+            # Покажем новый календарь, например, на тот же месяц
+            min_d = selected_date
+            kb = generate_calendar(selected_date.year, selected_date.month, min_date=min_d)
+            await callback_query.message.edit_text(
+                f"FROM date chosen: {selected_date}\nNow select TILL date:",
+                reply_markup=kb
+            )
+            await callback_query.answer()
+
+        elif st == STATE_TIMEOFF_TILL:
+            # user выбирает TILL
+            temp_user_data[user_id]["timeoff_till"] = selected_date
+            user_state[user_id] = STATE_TIMEOFF_REASON
+
+            await callback_query.message.edit_text(
+                f"TILL date chosen: {selected_date}\nPlease enter reason:",
+                reply_markup=None
+            )
+            await callback_query.answer()
+
+        else:
+            await callback_query.answer("Unexpected state!", show_alert=True)
+
+
 
 # ---------------------------
 #  Main message handler
@@ -150,13 +297,8 @@ async def handle_message(message: types.Message):
     current_cat = user_selected_category.get(user_id)
     current_state = user_state.get(user_id, STATE_NONE)
 
-    # ---------------------------
-    #  State: STATE_INLINE_EDIT
-    # ---------------------------
-    # Если пользователь уже нажал "Edit" (inline-кнопка), ждём финальное сообщение
+    # --- STATE_INLINE_EDIT ---
     if current_state == STATE_INLINE_EDIT:
-        # Пользователь отправляет отредактированный вопрос (inline result)
-        # Приходит новое message, которое мы принимаем как окончательный текст вопроса
         pending = pending_question.pop(user_id, None)
         if not pending:
             await message.answer("No pending question found.")
@@ -165,66 +307,49 @@ async def handle_message(message: types.Message):
 
         final_text = message.text
         category_name = pending["category"]
-
-        # Отправляем вопрос
         await send_question_directly(user_id, category_name, final_text, message)
-
         user_state[user_id] = STATE_NONE
         return
 
-    # ---------------------------
-    #  State: STATE_CONFIRM_PENDING
-    # ---------------------------
+    # --- STATE_CONFIRM_PENDING ---
     if current_state == STATE_CONFIRM_PENDING:
         if text == "Send":
-            # Отправляем вопрос
-            pending = pending_question.pop(user_id, None)
-            if not pending:
+            p = pending_question.pop(user_id, None)
+            if not p:
                 await message.answer("No pending question found.")
                 user_state[user_id] = STATE_NONE
                 return
-
-            await send_question_directly(
-                user_id,
-                pending["category"],
-                pending["question"],
-                message
-            )
+            await send_question_directly(user_id, p["category"], p["question"], message)
             return
-
         elif text == "Edit":
-            # Переходим к inline-редактированию
             user_state[user_id] = STATE_INLINE_EDIT
             old_text = pending_question[user_id]["question"]
-            inline_kb = types.InlineKeyboardMarkup()
+            inline_kb = InlineKeyboardMarkup()
             inline_kb.add(
-                types.InlineKeyboardButton(
+                InlineKeyboardButton(
                     "Edit in inline mode",
                     switch_inline_query_current_chat=old_text
                 )
             )
-            await message.answer("Click the button below to edit your question in inline mode.", reply_markup=inline_kb)
+            await message.answer("Click below to edit your question in inline mode.", reply_markup=inline_kb)
             return
-
         else:
-            # «No» или что-то другое => отмена
             pending_question.pop(user_id, None)
             await message.answer("Pending question canceled.")
             user_state[user_id] = STATE_NONE
-            # Показать меню
-            categories = await get_categories_async()
+
             kb = ReplyKeyboardMarkup(resize_keyboard=True)
-            existing_user = await get_teleuser_by_id(user_id)
-            if not existing_user:
+            tu = await get_teleuser_by_id(user_id)
+            if not tu:
                 kb.add("📋 Register")
-            for cat in categories:
-                kb.add(cat.name)
+            kb.add("Time Off")
+            cats = await get_categories_async()
+            for c in cats:
+                kb.add(c.name)
             await message.answer("Choose category:", reply_markup=kb)
             return
 
-    # ---------------------------
-    #  Registration flow
-    # ---------------------------
+    # --- Registration flow ---
     if text == "📋 Register" or text.lower() == "register":
         existing_user = await get_teleuser_by_id(user_id)
         if existing_user:
@@ -233,17 +358,11 @@ async def handle_message(message: types.Message):
         else:
             user_state[user_id] = STATE_REG_NAME
             temp_user_data[user_id] = {}
-            await message.answer("Enter your first name:", reply_markup=ReplyKeyboardRemove())
+            await message.answer("Enter your name:", reply_markup=ReplyKeyboardRemove())
             return
 
     if current_state == STATE_REG_NAME:
-        temp_user_data[user_id]["first_name"] = text
-        user_state[user_id] = STATE_REG_LASTNAME
-        await message.answer("Enter your last name:")
-        return
-
-    if current_state == STATE_REG_LASTNAME:
-        temp_user_data[user_id]["last_name"] = text
+        temp_user_data[user_id]["name"] = text
         user_state[user_id] = STATE_REG_NICKNAME
         await message.answer("Enter your nickname:")
         return
@@ -251,94 +370,175 @@ async def handle_message(message: types.Message):
     if current_state == STATE_REG_NICKNAME:
         temp_user_data[user_id]["nickname"] = text
         user_state[user_id] = STATE_REG_TRUCK
-        await message.answer("Enter your truck number (or type 'no' if none):")
+        await message.answer("Enter your truck number (or 'no' if none):")
         return
 
     if current_state == STATE_REG_TRUCK:
         temp_user_data[user_id]["truck_number"] = text
+        user_state[user_id] = STATE_REG_COMPANY
+        # Показываем список компаний
+        companies = await get_companies()
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        for comp in companies:
+            kb.add(comp.name)
+        await message.answer("Select your company:", reply_markup=kb)
+        return
+
+    if current_state == STATE_REG_COMPANY:
+        # Проверяем, есть ли такая компания
+        comp_name = text
+        comp_obj = await sync_to_async(Company.objects.filter(name=comp_name).first)()
+        if not comp_obj:
+            await message.answer("Company not found. Please select from list.")
+            return
+
+        temp_user_data[user_id]["company_id"] = comp_obj.id
         data = temp_user_data[user_id]
+        # Создаём TeleUser
         await create_teleuser(
             user_id,
-            data["first_name"],
-            data["last_name"],
+            data["name"],
             data["nickname"],
-            data["truck_number"]
+            data["truck_number"],
+            company_id=comp_obj.id
         )
         await message.answer("Registration complete!")
         user_state[user_id] = STATE_NONE
         temp_user_data[user_id] = {}
 
-        # Если есть pending question, предлагаем "Send"/"Edit"
+        # Если pending_question
         if user_id in pending_question:
-            pending = pending_question[user_id]
-            cat = pending["category"]
-            question_txt = pending["question"]
+            p = pending_question[user_id]
+            cat = p["category"]
+            qtxt = p["question"]
 
             kb = ReplyKeyboardMarkup(resize_keyboard=True)
             kb.add("Send", "Edit")
             kb.add("Cancel")
 
             await message.answer(
-                f"You had a pending question in category '{cat}':\n\n"
-                f"{question_txt}\n"
-                "Choose 'Send' to send immediately, or 'Edit' to rewrite in inline mode, or 'Cancel'.",
+                f"You had a pending question in category '{cat}':\n\n{qtxt}\n"
+                "Choose 'Send' or 'Edit' or 'Cancel'.",
                 reply_markup=kb
             )
             user_state[user_id] = STATE_CONFIRM_PENDING
             return
 
-        # Иначе - меню категорий
-        categories = await get_categories_async()
+        # Иначе меню
         kb = ReplyKeyboardMarkup(resize_keyboard=True)
-        for c in categories:
+        kb.add("Time Off")
+        cats = await get_categories_async()
+        for c in cats:
             kb.add(c.name)
         await message.answer("Now you can choose a category:", reply_markup=kb)
         return
 
-    # ---------------------------
-    #  If we're awaiting question
-    # ---------------------------
+    # --- Time Off flow ---
+    if text == "Time Off":
+        teleuser = await get_teleuser_by_id(user_id)
+        if not teleuser:
+            await message.answer("You are not registered. Please register first!")
+            return
+
+        if user_id not in temp_user_data:
+            temp_user_data[user_id] = {}
+
+        # Начинаем опрос дат
+        user_state[user_id] = STATE_TIMEOFF_FROM
+        today = date.today()
+        kb = generate_calendar(today.year, today.month, min_date=today)
+        await message.answer("Select FROM date:", reply_markup=kb)
+        return
+
+    if current_state == STATE_TIMEOFF_FROM:
+        await message.answer("Please select FROM date from the calendar above.")
+        return
+
+    if current_state == STATE_TIMEOFF_TILL:
+        await message.answer("Please select TILL date from the calendar above.")
+        return
+
+    if current_state == STATE_TIMEOFF_REASON:
+        temp_user_data[user_id]["timeoff_reason"] = text
+        user_state[user_id] = STATE_TIMEOFF_PAUSE
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.add("Yes", "No")
+        await message.answer("Pause Insurance and ELD?", reply_markup=kb)
+        return
+
+    if current_state == STATE_TIMEOFF_PAUSE:
+        p_text = text.lower()
+        pause_val = (p_text == "yes")
+        temp_user_data[user_id]["timeoff_pause"] = pause_val
+
+        # Создаём TimeOff
+        data = temp_user_data[user_id]
+        df = data["timeoff_from"]
+        dt = data["timeoff_till"]
+        reason = data["timeoff_reason"]
+
+        teleuser = await get_teleuser_by_id(user_id)
+        if not teleuser:
+            await message.answer("You are not registered! Something is off.")
+            user_state[user_id] = STATE_NONE
+            return
+
+
+        await create_timeoff(teleuser.id, df, dt, reason, pause_val)
+        await message.answer("Your Time-Off request is saved!", reply_markup=ReplyKeyboardRemove())
+
+        # Сброс
+        user_state[user_id] = STATE_NONE
+        temp_user_data[user_id] = {}
+
+        # Возвращаем меню
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.add("Time Off")
+        cats = await get_categories_async()
+        for c in cats:
+            kb.add(c.name)
+        await message.answer("Now you can choose a category:", reply_markup=kb)
+        return
+
+    # --- Another question flow ---
     if current_state == STATE_AWAITING_QUESTION and current_cat:
         teleuser = await get_teleuser_by_id(user_id)
         if not teleuser:
-            # Сохраняем pending
             pending_question[user_id] = {"category": current_cat, "question": text}
             kb = ReplyKeyboardMarkup(resize_keyboard=True)
             kb.add("📋 Register")
+            kb.add("Time Off")
             cats = await get_categories_async()
             for cat in cats:
                 kb.add(cat.name)
             await message.answer(
-                "You are not registered yet. Please press 'Register' first! \n <b>Registration</b> takes 30 seconds and is required only once per ID.",
+                "You are not registered yet. Please press 'Register' first!",
                 reply_markup=kb
             )
             user_selected_category[user_id] = None
             user_state[user_id] = STATE_NONE
             return
 
-        # Если user зарегистрирован - отправляем сразу
+        # User зарегистрирован, отправляем сразу
         await send_question_directly(user_id, current_cat, text, message)
         return
 
-    # ---------------------------
-    #  If text == "🔙 Back"
-    # ---------------------------
+    # --- "Back" button ---
     if text == "🔙 Back":
         user_selected_category[user_id] = None
         user_state[user_id] = STATE_NONE
-        cats = await get_categories_async()
         kb = ReplyKeyboardMarkup(resize_keyboard=True)
-        existing_user = await get_teleuser_by_id(user_id)
-        if not existing_user:
+        teleuser = await get_teleuser_by_id(user_id)
+        if not teleuser:
             kb.add("📋 Register")
+        kb.add("Time Off")
+        cats = await get_categories_async()
         for c in cats:
             kb.add(c.name)
         await message.answer("You have returned to the list of categories.", reply_markup=kb)
         return
 
-    # ---------------------------
-    #  Check if user selected a category
-    # ---------------------------
+    # --- Trying to select category ---
     try:
         cat_obj = await sync_to_async(Category.objects.get)(name=text)
         user_selected_category[user_id] = text
@@ -358,9 +558,7 @@ async def handle_message(message: types.Message):
     except Category.DoesNotExist:
         pass
 
-    # ---------------------------
-    #  If there's a current_cat, check ready questions
-    # ---------------------------
+    # --- If already chosen category, check ready questions ---
     if current_cat:
         questions = await get_questions_for_category_async(current_cat)
         found = None
@@ -374,14 +572,13 @@ async def handle_message(message: types.Message):
 
         if text == "Another question":
             user_state[user_id] = STATE_AWAITING_QUESTION
-            # remove keyboard
             await message.answer("Please enter your question:", reply_markup=ReplyKeyboardRemove())
             return
 
         await message.answer("I did not understand your choice. Please select a ready question, click 'Another question' or 'Back'.")
         return
 
-    # If none
+    # --- Otherwise ---
     await message.answer("Please choose a category or enter a command /start.")
 
 
@@ -395,12 +592,11 @@ async def send_question_directly(user_id: int, cat_name: str, question_text: str
         user_state[user_id] = STATE_NONE
         return
 
-    first_n = teleuser.first_name or ""
-    last_n = teleuser.last_name or ""
-    nick_n = teleuser.nickname or ""
-    user_display = f"{first_n} {last_n} ({nick_n}) - @{message.from_user.username or user_id}".strip()
+    # "Name" is stored in teleuser.first_name
+    name_val = teleuser.first_name or ""
+    nick_val = teleuser.nickname or ""
+    user_display = f"{name_val} ({nick_val}) - @{message.from_user.username or user_id}".strip()
 
-    # Сохраняем вопрос
     try:
         cat_obj = await sync_to_async(Category.objects.get)(name=cat_name)
         responsible_chat = cat_obj.responsible_chat
@@ -427,11 +623,11 @@ async def send_question_directly(user_id: int, cat_name: str, question_text: str
         try:
             chat_id_for_sending = int(responsible_chat)
             if responsible_topic_id and responsible_topic_id.isdigit():
-                topic_id_for_sending = int(responsible_topic_id)
+                tid = int(responsible_topic_id)
                 await bot.send_message(
                     chat_id_for_sending,
                     text=forward_text,
-                    message_thread_id=topic_id_for_sending
+                    message_thread_id=tid
                 )
             else:
                 await bot.send_message(chat_id_for_sending, forward_text)
@@ -442,16 +638,15 @@ async def send_question_directly(user_id: int, cat_name: str, question_text: str
     user_selected_category[user_id] = None
     user_state[user_id] = STATE_NONE
 
-    # Показываем меню категорий
+    # Show main menu
     cats = await get_categories_async()
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("Time Off")
     for c in cats:
         kb.add(c.name)
     kb.add("🔙 Back")
     await message.answer("Choose category:", reply_markup=kb)
 
-# ---------------------------
-#  Launch
-# ---------------------------
+
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
