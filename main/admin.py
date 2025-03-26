@@ -29,3 +29,7 @@ class QuestionAdmin(admin.ModelAdmin):
 @admin.register(UserQuestion)
 class UserQuestionAdmin(admin.ModelAdmin):
     list_display = ('username','group', 'date', 'category', 'question','responsible_id', 'id')
+
+@admin.register(BotConfig)
+class BotConfigAdmin(admin.ModelAdmin):
+    list_display = ["id", "manager_chat_id"]

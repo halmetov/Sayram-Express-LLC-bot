@@ -17,7 +17,7 @@ from aiogram.types import (
     InputTextMessageContent
 )
 
-from main.models import Category, Question, UserQuestion, TeleUser, Company, TimeOff
+from main.models import Category, Question, UserQuestion, TeleUser, Company, TimeOff, BotConfig
 from datetime import datetime
 import calendar
 from datetime import date
@@ -82,6 +82,14 @@ def create_teleuser(telegram_id, name, nickname, truck_number, company_id=None):
 @sync_to_async
 def get_companies():
     return list(Company.objects.all())
+
+
+@sync_to_async
+def get_manager_chat_id():
+    config = BotConfig.objects.first()
+    if config and config.manager_chat_id:
+        return config.manager_chat_id
+    return None
 
 @sync_to_async
 def create_timeoff(teleuser_id, date_from, date_till, reason, pause):
@@ -160,19 +168,24 @@ async def cmd_start(message: types.Message):
 
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     existing_user = await get_teleuser_by_id(user_id)
-    if not existing_user:
+    if existing_user:
+        # Если пользователь уже зарегистрирован — не показываем "Register"
+        kb.add("Time Off")
+        categories = await get_categories_async()
+        for cat in categories:
+            kb.add(cat.name)
+
+        await message.answer(
+            "Hello! Select category or press 'Time Off':",
+            reply_markup=kb
+        )
+    else:
+        # Если не зарегистрирован — показываем "Register"
         kb.add("📋 Register")
-    # Кнопка Time Off
-    kb.add("Time Off")
-
-    categories = await get_categories_async()
-    for cat in categories:
-        kb.add(cat.name)
-
-    await message.answer(
-        "Hello! Select category, press 'Time Off' or 'Register':",
-        reply_markup=kb
-    )
+        await message.answer(
+            "Hello! You need to register first. Press 'Register':",
+            reply_markup=kb
+        )
 
 def generate_calendar(year, month, min_date=None):
     kb = InlineKeyboardMarkup(row_width=7)
@@ -196,17 +209,12 @@ def generate_calendar(year, month, min_date=None):
     temp_row = []
     for d in month_days:
         if d.month != month:
-            # Дни не из этого месяца - пустые
             btn = InlineKeyboardButton(" ", callback_data="IGNORE")
         else:
-            # Проверяем min_date (если есть)
             if min_date and d < min_date:
-                # Дата до min_date => неактивна
                 btn = InlineKeyboardButton(str(d.day), callback_data="IGNORE")
             else:
-                # Можно выбрать
-                btn = InlineKeyboardButton(str(d.day),
-                                           callback_data=f"CALENDAR:{d.year}:{d.month}:{d.day}:DAY")
+                btn = InlineKeyboardButton(str(d.day), callback_data=f"CALENDAR:{d.year}:{d.month}:{d.day}:DAY")
         temp_row.append(btn)
         if len(temp_row) == 7:
             kb.row(*temp_row)
@@ -222,31 +230,52 @@ def generate_calendar(year, month, min_date=None):
 @dp.callback_query_handler(lambda c: c.data.startswith("CALENDAR"))
 async def process_calendar_callback(callback_query: types.CallbackQuery):
     data = callback_query.data.split(":")
-    # data = ["CALENDAR", "2023", "5", "NEXT"] ИЛИ ["CALENDAR", "2023", "5", "15", "DAY"]
+    # data может быть ["CALENDAR","2023","5","NEXT"]
+    # либо ["CALENDAR","2023","5","15","DAY"]
     year = int(data[1])
     month = int(data[2])
-    action = data[-1]  # "PREV", "NEXT" или "DAY"
-
+    action = data[-1]  # PREV / NEXT / DAY
     user_id = callback_query.from_user.id
-    # ВАЖНО: инициализируем temp_user_data, если не было
+
     if user_id not in temp_user_data:
         temp_user_data[user_id] = {}
 
-    if action == "PREV":
-        month -= 1
-        if month < 1:
-            month = 12
-            year -= 1
-        kb = generate_calendar(year, month)
-        await callback_query.message.edit_text("Select date:", reply_markup=kb)
-        await callback_query.answer()
+    st = user_state.get(user_id)
 
-    elif action == "NEXT":
-        month += 1
-        if month > 12:
-            month = 1
-            year += 1
-        kb = generate_calendar(year, month)
+    # Определим min_date в зависимости от стейта
+    if st == STATE_TIMEOFF_FROM:
+        # при выборе FROM запрещаем даты раньше сегодня
+        min_date = date.today()
+    elif st == STATE_TIMEOFF_TILL:
+        # при выборе TILL запрещаем даты раньше FROM
+        from_date = temp_user_data[user_id].get("timeoff_from", date.today())
+        min_date = from_date
+    else:
+        min_date = None
+
+    if action in ["PREV","NEXT"]:
+        # Расчёт нового (year, month)
+        if action == "PREV":
+            # Если пользователь уже на минимальном месяце, запретить
+            if min_date:
+                min_yr, min_mo = min_date.year, min_date.month
+                # Проверим, не выходит ли user за пределы
+                if (year < min_yr) or (year == min_yr and month <= min_mo):
+                    # Пользователь пытается уйти "назад" за пределы
+                    await callback_query.answer("Cannot go to previous months!", show_alert=True)
+                    return
+
+            month -= 1
+            if month < 1:
+                month = 12
+                year -= 1
+        else:  # NEXT
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+
+        kb = generate_calendar(year, month, min_date=min_date)
         await callback_query.message.edit_text("Select date:", reply_markup=kb)
         await callback_query.answer()
 
@@ -254,17 +283,19 @@ async def process_calendar_callback(callback_query: types.CallbackQuery):
         day = int(data[3])
         selected_date = date(year, month, day)
 
-        user_id = callback_query.from_user.id
-        st = user_state.get(user_id)
+        # Проверяем, не меньше ли selected_date min_date
+        if min_date and selected_date < min_date:
+            await callback_query.answer("This date is not allowed!", show_alert=True)
+            return
 
         if st == STATE_TIMEOFF_FROM:
-            # user wants FROM date
+            # Пользователь выбирает FROM
             temp_user_data[user_id]["timeoff_from"] = selected_date
-            # теперь переключаемся на TILL
             user_state[user_id] = STATE_TIMEOFF_TILL
-            # Покажем новый календарь, например, на тот же месяц
-            min_d = selected_date
-            kb = generate_calendar(selected_date.year, selected_date.month, min_date=min_d)
+
+            # Теперь для TILL:
+            # min_date = selected_date
+            kb = generate_calendar(selected_date.year, selected_date.month, min_date=selected_date)
             await callback_query.message.edit_text(
                 f"FROM date chosen: {selected_date}\nNow select TILL date:",
                 reply_markup=kb
@@ -272,20 +303,20 @@ async def process_calendar_callback(callback_query: types.CallbackQuery):
             await callback_query.answer()
 
         elif st == STATE_TIMEOFF_TILL:
-            # user выбирает TILL
+            # Пользователь выбирает TILL
             temp_user_data[user_id]["timeoff_till"] = selected_date
             user_state[user_id] = STATE_TIMEOFF_REASON
 
+            from_date = temp_user_data[user_id]["timeoff_from"]
+            # Покажем пользователью обе даты:
             await callback_query.message.edit_text(
-                f"TILL date chosen: {selected_date}\nPlease enter reason:",
+                f"You chose time off from {from_date} to {selected_date}.\nPlease enter reason:",
                 reply_markup=None
             )
             await callback_query.answer()
 
         else:
             await callback_query.answer("Unexpected state!", show_alert=True)
-
-
 
 # ---------------------------
 #  Main message handler
@@ -447,7 +478,8 @@ async def handle_message(message: types.Message):
         user_state[user_id] = STATE_TIMEOFF_FROM
         today = date.today()
         kb = generate_calendar(today.year, today.month, min_date=today)
-        await message.answer("Select FROM date:", reply_markup=kb)
+        await message.answer("Choose Time Off", reply_markup=ReplyKeyboardRemove())
+        await message.answer("Select FROM date: \nUse the inline calendar below:", reply_markup=kb)
         return
 
     if current_state == STATE_TIMEOFF_FROM:
@@ -485,7 +517,38 @@ async def handle_message(message: types.Message):
 
 
         await create_timeoff(teleuser.id, df, dt, reason, pause_val)
-        await message.answer("Your Time-Off request is saved!", reply_markup=ReplyKeyboardRemove())
+
+        manager_chat_id_str = await get_manager_chat_id()  # вернёт строку
+        if manager_chat_id_str:
+            try:
+                manager_chat_id = int(manager_chat_id_str)  # преобразуем к int
+            except ValueError:
+                # Если админ указал неверное значение
+                await message.answer("Manager chat ID in DB is not a valid integer!")
+                manager_chat_id = None
+        else:
+            manager_chat_id = None
+
+        user_display_name = teleuser.first_name or "Unknown"
+        user_nick = teleuser.nickname or ""
+        pause_text = "YES" if pause_val else "NO"
+        forward_text = (
+            f"New Time-Off request!\n"
+            f"User: {user_display_name} ({user_nick})\n"
+            f"From: {df}\n"
+            f"Till: {dt}\n"
+            f"Reason: {reason}\n"
+            f"Pause Insurance/ELD: {pause_text}"
+        )
+
+        if manager_chat_id:
+            try:
+                await bot.send_message(manager_chat_id, forward_text)
+            except Exception as e:
+                await message.answer(f"Failed to notify managers: {e}")
+
+        await message.answer("Your Time-Off request is saved! And sent to managers.", reply_markup=ReplyKeyboardRemove())
+
 
         # Сброс
         user_state[user_id] = STATE_NONE

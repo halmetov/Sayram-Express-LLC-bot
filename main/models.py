@@ -72,3 +72,15 @@ class UserQuestion(models.Model):
 
     def __str__(self):
         return f"Q from {self.username} on {self.date}"
+
+
+class BotConfig(models.Model):
+    manager_chat_id = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        help_text="Укажите ID чата/группы для уведомлений"
+    )
+
+    def __str__(self):
+        return f"BotConfig #{self.pk}"
