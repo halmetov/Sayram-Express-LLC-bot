@@ -28,7 +28,7 @@ class QuestionAdmin(admin.ModelAdmin):
 
 @admin.register(UserQuestion)
 class UserQuestionAdmin(admin.ModelAdmin):
-    list_display = ('username','group', 'date', 'category', 'question','responsible_id', 'id')
+    list_display = ('username', 'created_at', 'category', 'responsible_id', 'user_id')
 
 @admin.register(BotConfig)
 class BotConfigAdmin(admin.ModelAdmin):
