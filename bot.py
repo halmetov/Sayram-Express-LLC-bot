@@ -18,14 +18,13 @@ from aiogram.types import (
 )
 
 from main.models import Category, Question, UserQuestion, TeleUser, Company, TimeOff, BotConfig
-from datetime import datetime
+from datetime import datetime, date
 import calendar
-from datetime import date
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = "7628008847:AAExkl4-dWXo8etrnsR2LtipcxMKG7RR0JI"
+TOKEN = "7943795810:AAG0wun2bnwieW2K8Aefv9XHSXx2lFIJV8Y"
 bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
 
@@ -33,7 +32,6 @@ dp = Dispatcher(bot)
 #  States
 # ---------------------------
 STATE_NONE = "NONE"
-STATE_AWAITING_QUESTION = "AWAITING_QUESTION"
 STATE_CONFIRM_PENDING = "CONFIRM_PENDING"
 STATE_AWAITING_CONTENT = "AWAITING_CONTENT"
 
@@ -135,8 +133,8 @@ def save_user_question_async(user_id, username, category_name, content_text, con
 @dp.message_handler(lambda message: message.chat.type in ["group", "supergroup"])
 async def group_redirect(message: types.Message):
     text = message.text or ""
-    if "@sayram_help_bot" in text.lower():
-        bot_username = bot.get_me().username
+    bot_username = (await bot.get_me()).username.lower()
+    if f"@{bot_username}" in text.lower():
         inline_kb = InlineKeyboardMarkup().add(InlineKeyboardButton("Go to Bot", url=f"https://t.me/{bot_username}"))
         await message.reply(
             "Hello! I am a bot to assist drivers. Click the button below to start a private conversation with me. Please ask an administrator to pin this message to keep it accessible.",
@@ -150,7 +148,7 @@ async def group_redirect(message: types.Message):
 async def handle_bot_added_to_group(update: types.ChatMemberUpdated):
     if update.new_chat_member.status in ['member', 'administrator'] and update.old_chat_member.status == 'left':
         chat_id = update.chat.id
-        bot_username = bot.get_me().username
+        bot_username = (await bot.get_me()).username
         inline_kb = InlineKeyboardMarkup().add(InlineKeyboardButton("Go to Bot", url=f"https://t.me/{bot_username}"))
         await bot.send_message(
             chat_id=chat_id,
@@ -184,12 +182,11 @@ async def cmd_start(message: types.Message):
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     existing_user = await get_teleuser_by_id(user_id)
     if existing_user:
-        kb.add("Request Time Off")
         categories = await get_categories_async()
         for cat in categories:
             kb.add(cat.name)
         await message.answer(
-            "Hello! Select a category or press 'Request Time Off':",
+            "Hello! Select a category:",
             reply_markup=kb
         )
     else:
@@ -214,11 +211,15 @@ def generate_calendar(year, month, min_date=None):
     cal = calendar.Calendar(firstweekday=0)
     month_days = cal.itermonthdates(year, month)
     temp_row = []
+    today = date.today()
     for d in month_days:
         if d.month != month:
             btn = InlineKeyboardButton(" ", callback_data="IGNORE")
         else:
-            if min_date and d < min_date:
+            weekday = calendar.weekday(d.year, d.month, d.day)
+            if weekday in [5, 6]:  # Суббота и воскресенье
+                btn = InlineKeyboardButton(str(d.day), callback_data="IGNORE")
+            elif min_date and d < min_date:
                 btn = InlineKeyboardButton(str(d.day), callback_data="IGNORE")
             else:
                 btn = InlineKeyboardButton(str(d.day), callback_data=f"CALENDAR:{d.year}:{d.month}:{d.day}:DAY")
@@ -232,6 +233,7 @@ def generate_calendar(year, month, min_date=None):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("CALENDAR"))
 async def process_calendar_callback(callback_query: types.CallbackQuery):
+    logger.info(f"Processing calendar callback: {callback_query.data}")
     data = callback_query.data.split(":")
     year = int(data[1])
     month = int(data[2])
@@ -242,6 +244,8 @@ async def process_calendar_callback(callback_query: types.CallbackQuery):
         temp_user_data[user_id] = {}
 
     st = user_state.get(user_id)
+    logger.info(f"Current state for user {user_id}: {st}")
+
     if st == STATE_TIMEOFF_FROM:
         min_date = date.today()
     elif st == STATE_TIMEOFF_TILL:
@@ -251,6 +255,7 @@ async def process_calendar_callback(callback_query: types.CallbackQuery):
         min_date = None
 
     if action in ["PREV", "NEXT"]:
+        logger.info(f"Navigating calendar: {action}")
         if action == "PREV":
             if min_date:
                 min_yr, min_mo = min_date.year, min_date.month
@@ -270,28 +275,51 @@ async def process_calendar_callback(callback_query: types.CallbackQuery):
         await callback_query.message.edit_text("Select date:", reply_markup=kb)
         await callback_query.answer()
     elif action == "DAY":
+        logger.info(f"Day selected: {data[3]}")
         day = int(data[3])
         selected_date = date(year, month, day)
         if min_date and selected_date < min_date:
             await callback_query.answer("This date is not allowed!", show_alert=True)
             return
+        weekday = calendar.weekday(selected_date.year, selected_date.month, selected_date.day)
+        if weekday in [5, 6]:
+            await callback_query.answer("Weekends are not allowed!", show_alert=True)
+            return
         if st == STATE_TIMEOFF_FROM:
+            logger.info(f"FROM date selected: {selected_date}")
             temp_user_data[user_id]["timeoff_from"] = selected_date
             user_state[user_id] = STATE_TIMEOFF_TILL
             kb = generate_calendar(selected_date.year, selected_date.month, min_date=selected_date)
             await callback_query.message.edit_text(
-                f"FROM date chosen: {selected_date}\nNow select TILL date:",
+                f"FROM date chosen: {selected_date}\nNow select TILL date (max 7 days):",
                 reply_markup=kb
             )
             await callback_query.answer()
         elif st == STATE_TIMEOFF_TILL:
+            logger.info(f"TILL date selected: {selected_date}")
+            from_date = temp_user_data[user_id]["timeoff_from"]
+            logger.info(f"Comparing FROM {from_date} with TILL {selected_date}")
+            if (selected_date - from_date).days > 7:
+                await callback_query.answer("Maximum period is 7 days!", show_alert=True)
+                return
+            weekday_to = calendar.weekday(selected_date.year, selected_date.month, selected_date.day)
+            if weekday_to in [5, 6]:
+                await callback_query.answer("Weekends are not allowed!", show_alert=True)
+                return
             temp_user_data[user_id]["timeoff_till"] = selected_date
             user_state[user_id] = STATE_TIMEOFF_REASON
-            from_date = temp_user_data[user_id]["timeoff_from"]
-            await callback_query.message.edit_text(
-                f"You chose time off from {from_date} to {selected_date}.\nPlease enter reason:",
-                reply_markup=None
-            )
+            logger.info(f"Transitioning to STATE_TIMEOFF_REASON for user {user_id}")
+            try:
+                await callback_query.message.delete()
+                await callback_query.message.answer(
+                    f"You chose time off from {from_date} to {selected_date}.\nPlease enter reason:",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+            except Exception as e:
+                logger.error(f"Error while transitioning to reason step: {e}")
+                await callback_query.message.answer("An error occurred. Please start over with /start.")
+                user_state[user_id] = STATE_NONE
+                temp_user_data[user_id] = {}
             await callback_query.answer()
         else:
             await callback_query.answer("Unexpected state!", show_alert=True)
@@ -317,13 +345,10 @@ async def send_question_directly(user_id: int, cat_name: str, content_text: str,
         responsible_chat = None
 
     topic_id = None
-    # If personal topic_id is missing, use responsible_chat as the general chat
-    if cat_name.lower() == "accounting":
-        topic_id = teleuser.accounting_topic_id if teleuser.accounting_topic_id else responsible_chat
-    elif cat_name.lower() == "safety":
-        topic_id = teleuser.safety_topic_id if teleuser.safety_topic_id else responsible_chat
-    elif cat_name.lower() == "fleet":
-        topic_id = teleuser.operations_topic_id if teleuser.operations_topic_id else responsible_chat
+    if cat_name.lower() == "safety" and teleuser and teleuser.safety_topic_id:
+        topic_id = teleuser.safety_topic_id
+    elif responsible_chat:
+        topic_id = responsible_chat
 
     logger.info(f"Debug - User: {user_id}, Category: {cat_name}, Responsible Chat: {responsible_chat}, Topic ID: {topic_id}")
 
@@ -333,7 +358,6 @@ async def send_question_directly(user_id: int, cat_name: str, content_text: str,
             f"From user: {user_display}\n\n"
             f"Message: Please call me regarding {content_text or 'no text'}"
         )
-        # Add note if voice or photo is included
         if content_voice:
             forward_text += "\nVoice message included."
         if content_photo:
@@ -361,36 +385,27 @@ async def send_question_directly(user_id: int, cat_name: str, content_text: str,
     if responsible_chat and topic_id:
         try:
             chat_id_for_sending = int(responsible_chat)
-            if topic_id:
-                tid = int(topic_id)
-                if content_photo:
-                    await bot.send_photo(
-                        chat_id_for_sending,
-                        photo=content_photo,
-                        caption=forward_text,
-                        message_thread_id=tid if tid else None
-                    )
-                elif content_voice:
-                    await bot.send_voice(
-                        chat_id_for_sending,
-                        voice=content_voice,
-                        caption=forward_text,
-                        message_thread_id=tid if tid else None
-                    )
-                elif content_text:
-                    await bot.send_message(
-                        chat_id_for_sending,
-                        text=forward_text,
-                        message_thread_id=tid if tid else None
-                    )
-            else:
-                logger.warning(f"Invalid topic_id for user {user_id} in category {cat_name}")
-                if content_photo:
-                    await bot.send_photo(chat_id_for_sending, photo=content_photo, caption=forward_text)
-                elif content_voice:
-                    await bot.send_voice(chat_id_for_sending, voice=content_voice, caption=forward_text)
-                elif content_text:
-                    await bot.send_message(chat_id_for_sending, forward_text)
+            tid = int(topic_id) if topic_id else None
+            if content_photo:
+                await bot.send_photo(
+                    chat_id_for_sending,
+                    photo=content_photo,
+                    caption=forward_text,
+                    message_thread_id=tid
+                )
+            elif content_voice:
+                await bot.send_voice(
+                    chat_id_for_sending,
+                    voice=content_voice,
+                    caption=forward_text,
+                    message_thread_id=tid
+                )
+            elif content_text:
+                await bot.send_message(
+                    chat_id_for_sending,
+                    text=forward_text,
+                    message_thread_id=tid
+                )
         except Exception as e:
             logger.error(f"Failed to send to chat {responsible_chat}, topic {topic_id}: {e}")
             await message.answer(f"Failed to send to specialists: {e}")
@@ -400,12 +415,10 @@ async def send_question_directly(user_id: int, cat_name: str, content_text: str,
 
     action = "call request" if is_call_me else "question"
     await message.answer(f"Your {action} has been saved and sent to specialists. Thank you!")
-    user_selected_category[user_id] = None
     user_state[user_id] = STATE_NONE
 
     cats = await get_categories_async()
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("Request Time Off")
     for c in cats:
         kb.add(c.name)
     kb.add("Back")
@@ -416,12 +429,46 @@ async def send_question_directly(user_id: int, cat_name: str, content_text: str,
 # ---------------------------
 @dp.message_handler(content_types=['text', 'photo', 'voice'])
 async def handle_message(message: types.Message):
+    logger.info(f"Received message from user {message.from_user.id}: {message.text}")
+    if message.chat.type in ["group", "supergroup"]:
+        return
+
     text = message.caption or message.text.strip() if message.caption or message.text else None
     user_id = message.from_user.id
     current_cat = user_selected_category.get(user_id)
     current_state = user_state.get(user_id, STATE_NONE)
+    logger.info(f"User {user_id} state: {current_state}, category: {current_cat}")
 
-    # --- STATE_INLINE_EDIT ---
+    # --- Обработка кнопки "Back" для Time Off ---
+    if text == "Back" and current_state in [STATE_TIMEOFF_FROM, STATE_TIMEOFF_TILL, STATE_TIMEOFF_REASON, STATE_TIMEOFF_PAUSE]:
+        logger.info(f"User {user_id} canceled Time Off")
+        user_state[user_id] = STATE_NONE
+        temp_user_data[user_id] = {}
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.add("Request Time Off")
+        questions = await get_questions_for_category_async("Safety")
+        for q in questions:
+            kb.add(q.question)
+        kb.add("Ask your questions")
+        kb.add("Back")
+        await message.answer("Time-Off request canceled. You are in Safety category:", reply_markup=kb)
+        user_selected_category[user_id] = "Safety"
+        return
+
+    # --- Обработка кнопки "Back" для категорий ---
+    if text == "Back" and current_state == STATE_NONE:
+        user_selected_category[user_id] = None
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        teleuser = await get_teleuser_by_id(user_id)
+        if not teleuser:
+            kb.add("Register")
+        else:
+            cats = await get_categories_async()
+            for c in cats:
+                kb.add(c.name)
+        await message.answer("You have returned to the list of categories.", reply_markup=kb)
+        return
+
     if current_state == STATE_INLINE_EDIT:
         pending = pending_question.pop(user_id, None)
         if not pending:
@@ -434,7 +481,6 @@ async def handle_message(message: types.Message):
         user_state[user_id] = STATE_NONE
         return
 
-    # --- STATE_CONFIRM_PENDING ---
     if current_state == STATE_CONFIRM_PENDING:
         if text == "Send":
             p = pending_question.pop(user_id, None)
@@ -464,22 +510,19 @@ async def handle_message(message: types.Message):
             teleuser = await get_teleuser_by_id(user_id)
             if not teleuser:
                 kb.add("Register")
-            kb.add("Request Time Off")
             cats = await get_categories_async()
             for c in cats:
                 kb.add(c.name)
             await message.answer("Choose a category:", reply_markup=kb)
             return
 
-    # --- STATE_AWAITING_CONTENT ---
     if current_state == STATE_AWAITING_CONTENT and current_cat:
         teleuser = await get_teleuser_by_id(user_id)
         if not teleuser:
             pending_question[user_id] = {"category": current_cat, "content_text": text or "", "content_photo": "",
-                                         "content_voice": ""}
+                                       "content_voice": ""}
             kb = ReplyKeyboardMarkup(resize_keyboard=True)
             kb.add("Register")
-            kb.add("Request Time Off")
             cats = await get_categories_async()
             for c in cats:
                 kb.add(c.name)
@@ -495,14 +538,12 @@ async def handle_message(message: types.Message):
         content_photo = message.photo[-1].file_id if message.photo else ""
         content_voice = message.voice.file_id if message.voice else ""
 
-        # Immediate send for all content types
         if content_text or content_photo or content_voice:
             await send_question_directly(user_id, current_cat, content_text, content_photo, content_voice, message)
         else:
             await message.answer("Please provide a text, photo, or voice message.")
         return
 
-    # --- Registration flow ---
     if text == "Register":
         existing_user = await get_teleuser_by_id(user_id)
         if existing_user:
@@ -549,15 +590,13 @@ async def handle_message(message: types.Message):
             return
 
         kb = ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.add("Request Time Off")
         cats = await get_categories_async()
         for c in cats:
             kb.add(c.name)
         await message.answer("Now you can choose a category:", reply_markup=kb)
         return
 
-    # --- Time Off flow ---
-    if text == "Request Time Off":
+    if text == "Request Time Off" and current_cat == "Safety":
         teleuser = await get_teleuser_by_id(user_id)
         if not teleuser:
             await message.answer("You are not registered. Please register first!")
@@ -567,8 +606,11 @@ async def handle_message(message: types.Message):
         user_state[user_id] = STATE_TIMEOFF_FROM
         today = date.today()
         kb = generate_calendar(today.year, today.month, min_date=today)
+        timeoff_kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        timeoff_kb.add("Back")
         await message.answer("Request Time Off", reply_markup=ReplyKeyboardRemove())
-        await message.answer("Select FROM date: \nUse the calendar below:", reply_markup=kb)
+        await message.answer("Select FROM date (Mon-Fri only, max 7 days):\nUse the calendar below:", reply_markup=kb)
+        await message.answer("To cancel, press 'Back'", reply_markup=timeoff_kb)
         return
 
     if current_state == STATE_TIMEOFF_FROM:
@@ -584,6 +626,7 @@ async def handle_message(message: types.Message):
         user_state[user_id] = STATE_TIMEOFF_PAUSE
         kb = ReplyKeyboardMarkup(resize_keyboard=True)
         kb.add("Yes", "No")
+        kb.add("Back")
         await message.answer("Pause Insurance and ELD?", reply_markup=kb)
         return
 
@@ -621,69 +664,48 @@ async def handle_message(message: types.Message):
             f"Reason: {reason}\n"
             f"Pause Insurance/ELD: {pause_text}"
         )
-        if manager_chat_id:
+        try:
+            cat_obj = await sync_to_async(Category.objects.get)(name="Safety")
+            responsible_chat = cat_obj.responsible_chat
+        except Category.DoesNotExist:
+            responsible_chat = None
+
+        topic_id = None
+        if teleuser and teleuser.safety_topic_id:
+            topic_id = teleuser.safety_topic_id
+        elif responsible_chat:
+            topic_id = responsible_chat
+
+        if responsible_chat and topic_id:
             try:
-                await bot.send_message(manager_chat_id, forward_text)
+                chat_id_for_sending = int(responsible_chat)
+                tid = int(topic_id) if topic_id else None
+                await bot.send_message(
+                    chat_id_for_sending,
+                    text=forward_text,
+                    message_thread_id=tid
+                )
             except Exception as e:
-                await message.answer(f"Failed to notify managers: {e}")
-        await message.answer("Your Time-Off request has been saved and sent to managers.", reply_markup=ReplyKeyboardRemove())
+                logger.error(f"Failed to send to chat {responsible_chat}, topic {topic_id}: {e}")
+                await message.answer(f"Failed to send to specialists: {e}")
+        else:
+            logger.warning(f"Missing responsible_chat or topic_id for Time Off, user {user_id}")
+            await message.answer("Cannot send the message: group or topic not configured.")
+
+        await message.answer("Your Time-Off request has been saved and sent to specialists.", reply_markup=ReplyKeyboardRemove())
         user_state[user_id] = STATE_NONE
         temp_user_data[user_id] = {}
         kb = ReplyKeyboardMarkup(resize_keyboard=True)
         kb.add("Request Time Off")
-        cats = await get_categories_async()
-        for c in cats:
-            kb.add(c.name)
-        await message.answer("Now you can choose a category:", reply_markup=kb)
+        questions = await get_questions_for_category_async("Safety")
+        for q in questions:
+            kb.add(q.question)
+        kb.add("Ask your questions")
+        kb.add("Back")
+        await message.answer("You are in Safety category:", reply_markup=kb)
+        user_selected_category[user_id] = "Safety"
         return
 
-    # --- STATE_AWAITING_QUESTION (Call me) ---
-    if current_state == STATE_AWAITING_QUESTION and current_cat:
-        teleuser = await get_teleuser_by_id(user_id)
-        if not teleuser:
-            pending_question[user_id] = {"category": current_cat, "content_text": message.text or "", "content_photo": "", "content_voice": ""}
-            kb = ReplyKeyboardMarkup(resize_keyboard=True)
-            kb.add("Register")
-            kb.add("Request Time Off")
-            cats = await get_categories_async()
-            for c in cats:
-                kb.add(c.name)
-            await message.answer(
-                "You are not registered yet. Please press 'Register' first!",
-                reply_markup=kb
-            )
-            user_selected_category[user_id] = None
-            user_state[user_id] = STATE_NONE
-            return
-
-        content_text = message.text or message.caption or ""
-        content_photo = message.photo[-1].file_id if message.photo else ""
-        content_voice = message.voice.file_id if message.voice else ""
-
-        # Проверяем, что мы в состоянии ожидания звонка и есть контент
-        if current_state == STATE_AWAITING_QUESTION and (content_text or content_photo or content_voice):
-            await send_question_directly(user_id, current_cat, content_text, content_photo, content_voice, message, is_call_me=True)
-        else:
-            # Если нет контента, просим предоставить детали
-            await message.answer("Please provide details for your call request (text, photo, or voice).")
-        return
-
-    # --- Back button ---
-    if text == "Back":
-        user_selected_category[user_id] = None
-        user_state[user_id] = STATE_NONE
-        kb = ReplyKeyboardMarkup(resize_keyboard=True)
-        teleuser = await get_teleuser_by_id(user_id)
-        if not teleuser:
-            kb.add("Register")
-        kb.add("Request Time Off")
-        cats = await get_categories_async()
-        for c in cats:
-            kb.add(c.name)
-        await message.answer("You have returned to the list of categories.", reply_markup=kb)
-        return
-
-    # --- Trying to select category ---
     try:
         cat_obj = await sync_to_async(Category.objects.get)(name=text)
         user_selected_category[user_id] = text
@@ -692,18 +714,18 @@ async def handle_message(message: types.Message):
         kb = ReplyKeyboardMarkup(resize_keyboard=True)
         for q in questions:
             kb.add(q.question)
-        kb.add("Another question")
-        kb.add("Call me")
+        kb.add("Ask your questions")
+        if text == "Safety":
+            kb.add("Request Time Off")
         kb.add("Back")
         await message.answer(
-            f"Category: <b>{text}</b>\nChoose a ready-made question, click 'Another question', or 'Call me':",
+            f"Category: <b>{text}</b>\nChoose a ready-made question or click 'Ask your questions':",
             reply_markup=kb
         )
         return
     except Category.DoesNotExist:
         pass
 
-    # --- If already chosen category, check ready questions ---
     if current_cat:
         questions = await get_questions_for_category_async(current_cat)
         found = None
@@ -714,26 +736,14 @@ async def handle_message(message: types.Message):
         if found:
             await message.answer(found.answer)
             return
-        if text == "Another question":
+        if text == "Ask your questions":
             user_state[user_id] = STATE_AWAITING_CONTENT
             await message.answer("Send text, photo, or voice message (or any combination):", reply_markup=ReplyKeyboardRemove())
             return
-        if text == "Call me":
-            user_state[user_id] = STATE_AWAITING_QUESTION
-            await message.answer("Please enter details for your call request (text, photo, or voice):", reply_markup=ReplyKeyboardRemove())
-            return
-        await message.answer("I did not understand your choice. Please select a ready question, click 'Another question', 'Call me', or 'Back'.")
+        await message.answer("I did not understand your choice. Please select a ready question, click 'Ask your questions', or 'Back'.")
         return
 
-    # --- Otherwise ---
     await message.answer("Please choose a category or enter command /start.")
-
-# # ---------------------------
-# #  Startup handler
-# # ---------------------------
-# @dp.startup
-# async def on_startup(_):
-#     logger.info("Bot is starting up...")
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
